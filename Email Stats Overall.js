@@ -2,8 +2,7 @@ const CONFIG = {
   AWEBER: {
     CLIENT_ID: '',
     CLIENT_SECRET: '',
-    REDIRECT_URI:
-      'callback URL',
+    REDIRECT_URI:'https://script.google.com/macros/d/{PLACEHOLDER FOR SCRIPT ID}/usercallback',
     SCOPES: [
       'account.read',
       'list.read',
@@ -37,41 +36,63 @@ const CONFIG = {
 
 function updateSubscriberDetails() {
   const startTime = Date.now();
-  console.log("Starting subscriber update");
-  
+  logOutput("Starting subscriber update"); 
+
   try {
+    const token = getValidAccessToken();
+    if (!token) {
+      logOutput("updateSubscriberDetails: Halting execution - No valid access token obtained. Check notifications/logs.");
+      return; 
+    }
+
+    const accountId = getAWeberAccountId(token);
+    if (!accountId) { 
+        logOutput("updateSubscriberDetails: Failed to get Account ID. Halting.");
+        return;
+    }
+    const listIds = getListIds(accountId, token); 
+    if (!listIds || listIds.length === 0) { // Add check
+        logOutput("updateSubscriberDetails: Failed to get List IDs or no lists found. Halting.");
+        return;
+    }
+
     // Initialize sheet
     const sheet = getOrCreateSheet(
       CONFIG.SHEET.SUBSCRIBER_DETAILS_SHEET_NAME,
       CONFIG.SHEET.SUBSCRIBER_DETAILS_HEADERS
     );
-    
-    // Get auth tokens
-    const token = getValidAccessToken();
-    const accountId = getAWeberAccountId(token);
-    const listIds = getListIds(accountId, token);
-    
+     if (!sheet) { // Add check
+        logOutput("updateSubscriberDetails: Failed to get or create subscriber details sheet. Halting.");
+        // sendErrorNotification("Sheet Access Error", `Could not access or create sheet: ${CONFIG.SHEET.SUBSCRIBER_DETAILS_SHEET_NAME}`); // Redundant if getOrCreateSheet sends notification
+        return;
+    }
+
     // Determine sync mode
     const isFirstRun = sheet.getLastRow() <= 1;
     if (isFirstRun) {
-      console.log("First run - bulk loading");
-      bulkLoadSubscribers(accountId, listIds, token, sheet);
-      // Set initial sync timestamp
+      logOutput("First run - bulk loading");
+      bulkLoadSubscribers(accountId, listIds, token, sheet); // Assumes this handles errors internally or throws
       PropertiesService.getScriptProperties()
-        .setProperty('lastSyncTimestamp', Date.now());
+        .setProperty('lastSyncTimestamp', Date.now().toString()); // Ensure string
     } else {
-      console.log("Incremental update mode");
-      incrementalSubscriberUpdate(accountId, listIds, token, sheet);
+      logOutput("Incremental update mode");
+      incrementalSubscriberUpdate(accountId, listIds, token, sheet); // Assumes this handles errors internally or throws
     }
-    
+
     // Calculate stats (only if we have data)
     if (sheet.getLastRow() > 1) {
-      calculateOverallStatsFromSheet();
+      calculateOverallStatsFromSheet(); // Assumes this handles errors internally or throws
     }
-    
-    console.log(`Update completed in ${(Date.now()-startTime)/1000}s`);
+    // --- End Original logic ---
+
+    logOutput(`Update completed successfully in ${(Date.now()-startTime)/1000}s`);
+
+  // *** ADDED: Catch block for unexpected errors ***
   } catch (e) {
-    console.error(`Update error: ${e.message}`);
+    const errorMessage = `FATAL ERROR in updateSubscriberDetails: ${e.message}\nStack: ${e.stack || 'No stack available'}`;
+    logOutput(errorMessage);
+    // Send notification for unexpected errors caught here
+    sendErrorNotification("AWeber Subscriber Update Failed", errorMessage);
   }
 }
 
@@ -153,13 +174,21 @@ function incrementalSubscriberUpdate(accountId, listIds, token, sheet) {
   let lastSync = scriptProps.getProperty('lastSyncTimestamp');
   
   // Set default to 24 hours ago if no timestamp exists
-  if (!lastSync || lastSync < 100000000000) { // Older than 2001
-    lastSync = Date.now() - 86400000; // 24 hours ago
-    console.log("Resetting invalid timestamp to 24 hours ago");
-    scriptProps.setProperty('lastSyncTimestamp', lastSync);
+  if (!lastSync || isNaN(parseInt(lastSync))) {
+    // First run: pull all data
+    console.log("First run: pulling all subscriber data");
+    lastSync = 0;
   } else {
-    lastSync = parseInt(lastSync);
+    // Subsequent runs: check changes from last 7 days only
+    const oneWeekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    if (parseInt(lastSync) < oneWeekAgo) {
+      console.log("Returning changes from last 7 days");
+      lastSync = oneWeekAgo;
+    } else {
+      lastSync = parseInt(lastSync);
+    }
   }
+
 
   console.log(`Fetching changes since ${new Date(lastSync).toISOString()}`);
   
@@ -263,7 +292,6 @@ function getIncrementalSubscribersData(accountId, listIds, token, sinceTimestamp
   return allSubscribers;
 }
 
-
 function getAllSubscribersData(accountId, listIds, token, maxTime = 240000) {
   let allSubscribers = [];
   const startTime = Date.now();
@@ -284,7 +312,6 @@ function getAllSubscribersData(accountId, listIds, token, maxTime = 240000) {
   }
   return allSubscribers;
 }
-
 
 function calculateOverallStatsFromSheet() {
   try {
@@ -793,7 +820,7 @@ function getOrCreateOverallSheet() {
   return sheet;
 }
 
-// OAuth Service Functions
+// OAuth Service Functions (Modified refreshToken)
 function getAWeberService() {
   const service = OAuth2.createService('AWeber')
     .setAuthorizationBaseUrl('https://auth.aweber.com/oauth2/authorize')
@@ -803,47 +830,81 @@ function getAWeberService() {
     .setCallbackFunction('authCallback')
     .setPropertyStore(PropertiesService.getScriptProperties())
     .setScope(CONFIG.AWEBER.SCOPES)
-    .setRedirectUri(CONFIG.AWEBER.REDIRECT_URI)
-    .setParam('grant_type', 'authorization_code');
+    .setRedirectUri(CONFIG.AWEBER.REDIRECT_URI);
+    // Remove .setParam('grant_type', 'authorization_code');
 
+  // --- MODIFIED Refresh Handler ---
   service.refreshToken = function () {
     const props = PropertiesService.getScriptProperties();
-    const token = props.getProperty('oauth2.AWeber');
-    if (!token) {
-      console.error('refreshToken: No token found in properties.');
+    const tokenJson = props.getProperty('oauth2.AWeber'); // Use consistent naming
+    if (!tokenJson) {
+      logOutput('refreshToken: No token JSON found in properties. Cannot refresh.');
       return null;
     }
     try {
-      const refreshToken = JSON.parse(token).refresh_token;
-      const headers = {
-        Authorization:
-          'Basic ' +
-          Utilities.base64Encode(
-            CONFIG.AWEBER.CLIENT_ID + ':' + CONFIG.AWEBER.CLIENT_SECRET
-          ),
-        'Content-Type': 'application/x-www-form-urlencoded',
-      };
-      const payload = { grant_type: 'refresh_token', refresh_token: refreshToken };
-      const options = { method: 'post', headers: headers, payload: payload };
-      const response = UrlFetchApp.fetch(
-        'https://auth.aweber.com/oauth2/token',
-        options
-      );
-      if (response.getResponseCode() !== 200) {
-        console.error(
-          `refreshToken: Refresh failed with code: ${response.getResponseCode()}, content: ${response.getContentText()}`
-        );
+      const tokenData = JSON.parse(tokenJson);
+      const refreshToken = tokenData.refresh_token;
+      if (!refreshToken) {
+        logOutput('refreshToken: Refresh token missing from stored properties.');
+        props.deleteProperty('oauth2.AWeber'); // Clear bad/incomplete token
+        // *** Send notification if refresh token missing ***
+        sendErrorNotification("AWeber Refresh Token Missing", "Stored AWeber token data is missing the refresh token. Manual re-authorization required via the menu.");
         return null;
       }
-      const newToken = JSON.parse(response.getContentText());
+
+      const headers = {
+        'Authorization': 'Basic ' + Utilities.base64Encode(CONFIG.AWEBER.CLIENT_ID + ':' + CONFIG.AWEBER.CLIENT_SECRET),
+        'Content-Type': 'application/x-www-form-urlencoded',
+      };
+      const payload = { 'grant_type': 'refresh_token', 'refresh_token': refreshToken };
+      const options = {
+        'method': 'post',
+        'headers': headers,
+        'payload': payload,
+        'muteHttpExceptions': true // Handle errors manually
+      };
+      logOutput('refreshToken: Attempting to refresh token...');
+      const response = UrlFetchApp.fetch('https://auth.aweber.com/oauth2/token', options);
+      const responseCode = response.getResponseCode();
+      const responseText = response.getContentText();
+
+      if (responseCode !== 200) {
+        logOutput(`refreshToken: Refresh failed with code: ${responseCode}, content: ${responseText}`);
+        // *** ADDED: Check for invalid_grant and notify ***
+        try {
+          const errorResponse = JSON.parse(responseText);
+          if (errorResponse.error === 'invalid_grant') { // Specific check
+            logOutput("!!! REFRESH TOKEN IS INVALID. MANUAL RE-AUTHORIZATION REQUIRED !!!");
+            props.deleteProperty('oauth2.AWeber'); // Clear the invalid token
+            sendErrorNotification("AWeber Refresh Token Invalid", "The AWeber refresh token is invalid and has been cleared. Manual re-authorization is required via the 'Authorize AWeber' menu item.");
+          } else {
+            // Optional: Notify on other refresh errors? Maybe too noisy.
+            // sendErrorNotification("AWeber Token Refresh Failed", `Failed to refresh AWeber token. Status: ${responseCode}. Error: ${responseText}. Manual re-authorization may be required.`);
+          }
+        } catch (parseError) {
+          // Optional: Notify on parse error?
+          // sendErrorNotification("AWeber Token Refresh Failed", `Failed to refresh AWeber token and parse error response. Status: ${responseCode}. Content: ${responseText}. Manual re-authorization may be required.`);
+          logOutput("Could not parse error response from token endpoint: " + parseError);
+        }
+        // *** END ADDED SECTION ***
+        return null; // Indicate failure IMPORTANT
+      }
+
+      // Success path (Original logic)
+      const newToken = JSON.parse(responseText);
       props.setProperty('oauth2.AWeber', JSON.stringify(newToken));
-      console.log(`refreshToken: New token obtained: ${newToken.access_token.slice(-4)}`);
-      return newToken.access_token;
+      logOutput(`refreshToken: New token obtained: ${newToken.access_token ? newToken.access_token.slice(-4) : 'N/A'}`);
+      return newToken.access_token; // Return the new access token
+
     } catch (e) {
-      console.error('refreshToken: Refresh failed:', e);
-      return null;
+      const errorMessage = `refreshToken: Unhandled exception: ${e.message}`;
+      logOutput(errorMessage);
+      // *** Send notification on unexpected error ***
+      sendErrorNotification("AWeber Token Refresh Error", errorMessage);
+      return null; // Indicate failure
     }
-  };
+  }; // End of custom refreshToken override
+
   return service;
 }
 
@@ -871,33 +932,52 @@ function validateToken(service) {
   }
 }
 
+// Modified getValidAccessToken
 function getValidAccessToken() {
   const service = getAWeberService();
-  let token = service.getAccessToken();
-  if (!token) {
-    console.log('getValidAccessToken: No access token found.');
-    return service.refreshToken();
+  let token = service.getAccessToken(); // Try to get current token
+
+  // If token exists, validate it
+  if (token) {
+      // logOutput('getValidAccessToken: Found existing token, validating...'); // Less verbose logging
+      const options = {
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+        muteHttpExceptions: true,
+      };
+      const response = UrlFetchApp.fetch('https://api.aweber.com/1.0/accounts', options);
+      const code = response.getResponseCode();
+
+      if (code === 200) {
+          // logOutput('getValidAccessToken: Existing token is valid.'); // Less verbose logging
+          return token; // Token is good
+      }
+
+      if (code === 401) {
+          logOutput('getValidAccessToken: Existing token returned 401, attempting refresh...');
+          // Fall through to refresh below
+      } else {
+          // Unexpected error during validation
+          logOutput(`getValidAccessToken: Unexpected validation error. Code: ${code}, Content: ${response.getContentText()}`);
+          // Treat as potentially needing refresh or re-auth
+          // Fall through to refresh below, but maybe notify?
+          // sendErrorNotification("AWeber Auth Validation Error", `Validation call failed with code ${code}. Re-authorization may be needed.`);
+      }
+  } else {
+      logOutput('getValidAccessToken: No existing token found.');
   }
-  console.log('getValidAccessToken: Current token:', token.slice(-4));
-  const options = {
-    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-    muteHttpExceptions: true,
-  };
-  const response = UrlFetchApp.fetch(
-    'https://api.aweber.com/1.0/accounts',
-    options
-  );
-  const code = response.getResponseCode();
-  if (code === 401) {
-    console.log('getValidAccessToken: Access token expired, refreshing...');
-    token = service.refreshToken();
-    if (!token) {
-      console.error('getValidAccessToken: Token refresh failed.');
-      return null;
-    }
-    console.log('getValidAccessToken: New access token obtained:', token.slice(-4));
+
+  // Attempt refresh if no token existed or validation failed/returned 401
+  logOutput('getValidAccessToken: Attempting token refresh...');
+  token = service.refreshToken(); // Call the modified refreshToken function
+
+  if (!token) { // *** ADDED CHECK ***
+    logOutput('getValidAccessToken: Token refresh failed.');
+    // Notification should have been sent by the refreshToken function itself
+    return null; // Explicitly return null on failure
   }
-  return token;
+
+  logOutput('getValidAccessToken: New access token obtained after refresh:', token.slice(-4));
+  return token; // Return the newly obtained token or null if refresh failed
 }
 
 function fetchApi(url, token, retryCount = 0) {
@@ -950,7 +1030,7 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('AWeber Integration')
     .addItem('Authorize AWeber', 'authorizeAWeber')
-    .addItem('Fetch Broadcast Data', 'fetchAWeberBroadcastData')
+    .addItem('Fetch Email Stats', 'updateSubscriberDetails')
     .addItem('Reset Authorization', 'resetAuth')
     .addItem('Debug Storage', 'debugStorage')
     .addToUi();
@@ -960,18 +1040,34 @@ function authorizeAWeber() {
   const service = getAWeberService();
   if (!service.hasAccess()) {
     const authUrl = service.getAuthorizationUrl();
-    SpreadsheetApp.getUi().alert(
-      'Please authorize using this URL, then run "Fetch Broadcast Data" again: ' +
-        authUrl
-    );
+    // Use HTML service for a better user experience and trigger safety
+    const htmlOutput = HtmlService.createHtmlOutput(
+        `<p>Please authorize this script to access your AWeber account:</p>
+         <p><a href="${authUrl}" target="_blank" onclick="google.script.host.close()">Click here to Authorize</a></p>
+         <p>After authorizing in AWeber, close that window. You may need to run the 'Update' function again manually once.</p>
+         <input type="button" value="Close" onclick="google.script.host.close()" />` // Add close button
+      )
+      .setWidth(400)
+      .setHeight(150);
+    SpreadsheetApp.getUi().showModalDialog(htmlOutput, 'AWeber Authorization Required'); // Show modal
   } else {
-    SpreadsheetApp.getUi().alert('AWeber is already authorized.');
+    // Still use alert here as it's manually triggered from menu
+    SpreadsheetApp.getUi().alert('AWeber connection is already authorized.');
   }
 }
 
+
 function resetAuth() {
-  getAWeberService().reset();
-  logOutput('Authorization has been reset. Please re-authorize.');
+  try {
+      const service = getAWeberService();
+      service.reset(); // Clears stored tokens
+      logOutput('Authorization has been reset. Please use "Authorize AWeber" again.');
+      // Provide UI feedback since this is usually run manually
+      SpreadsheetApp.getUi().alert('AWeber authorization has been reset. Please use "Authorize AWeber" from the menu to re-authorize.');
+  } catch (e) {
+      logOutput(`Error during resetAuth: ${e.message}`);
+      SpreadsheetApp.getUi().alert(`An error occurred while resetting authorization: ${e.message}`);
+  }
 }
 
 function debugStorage() {
@@ -1012,10 +1108,10 @@ function getListIds(accountId, token) {
   );
   return response.entries.map((list) => list.id);
 }
+
 function logOutput(message) {
   console.log(message);
 }
-
 
 function resetSync() {
   PropertiesService.getScriptProperties().deleteProperty('lastSyncTimestamp');
@@ -1032,4 +1128,54 @@ function forceFullSync() {
   
   PropertiesService.getScriptProperties().deleteProperty('lastSyncTimestamp');
   updateSubscriberDetails();
+}
+
+/**
+ * Sends an email notification for script errors. Includes debouncing.
+ * @param {string} subject The subject line prefix.
+ * @param {string} body The email body content.
+ */
+function sendErrorNotification(subject, body) {
+  // Debounce: Prevent sending too many emails in rapid succession for the same error
+  try {
+      const cache = CacheService.getScriptCache();
+      if (!cache) {
+          logOutput("Warning: Script Cache service not available for debouncing notifications.");
+      } else {
+          const cacheKey = `error_notification_${subject.replace(/[^a-zA-Z0-9]/g, '_')}`; // Sanitize key
+          if (cache.get(cacheKey)) {
+              // logOutput(`Skipping notification, already sent recently for: ${subject}`);
+              return; // Already sent recently
+          }
+          // Set cache immediately to reduce race conditions
+          cache.put(cacheKey, 'sent', 3600); // Cache for 3600 seconds (1 hour)
+      }
+  } catch (cacheError) {
+      logOutput(`Warning: Could not access cache service for debouncing. ${cacheError.message}`);
+  }
+
+  try {
+    let recipient = Session.getEffectiveUser().getEmail(); // Gets email of user who authorized/owns the script
+    let actualRecipient = recipient;
+
+    if (!actualRecipient) {
+       // Fallback email - *** REPLACE WITH YOUR EMAIL ***
+       actualRecipient = "xxxxxxxxxx@gmail.com"; // <<<< SET YOUR EMAIL HERE
+       logOutput(`sendErrorNotification: Could not get effective user email. Using fallback: ${actualRecipient}`);
+       if (actualRecipient === "xxxxxxxxxx@gmail.com") { // Don't send to placeholder
+          logOutput("sendErrorNotification: Fallback email not set. Cannot send notification.");
+          return;
+       }
+    }
+
+    const fullSubject = `[AWeber Script Alert] ${subject}`;
+    const maxBodyLength = 1500; // Limit body length
+    const emailBody = `Timestamp: ${Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss Z")}\n\n${body.length > maxBodyLength ? body.substring(0, maxBodyLength) + "\n..." : body}`;
+
+    MailApp.sendEmail(actualRecipient, fullSubject, emailBody);
+    logOutput(`Sent error notification email to ${actualRecipient} for subject: ${subject}`);
+
+  } catch (e) {
+    logOutput(`Failed to send error notification email. Subject: ${subject}. Error: ${e.message}`);
+  }
 }
